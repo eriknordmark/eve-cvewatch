@@ -33,16 +33,16 @@ fi
 # Run comparison
 log_info "Running comparison between master and PR scan results..."
 
-RUN_CMD="python3 $COMPARE_SCRIPT $MASTER_FILE $PR_FILE"
+RUN_CMD=(python3 "$COMPARE_SCRIPT" "$MASTER_FILE" "$PR_FILE")
 if [ -n "$IGNORE_FILE" ]; then
     if [ ! -f "$IGNORE_FILE" ]; then
         log_error "Ignore file not found: $IGNORE_FILE"
         exit 1
     fi
-    RUN_CMD="$RUN_CMD $IGNORE_FILE"
+    RUN_CMD+=("$IGNORE_FILE")
 fi
 if [ -n "$REPORT_FILE" ]; then
-    $RUN_CMD 2>&1 | tee "$REPORT_FILE"
+    "${RUN_CMD[@]}" 2>&1 | tee "$REPORT_FILE"
 else
-    log_cmd $RUN_CMD
+    log_cmd "${RUN_CMD[@]}"
 fi

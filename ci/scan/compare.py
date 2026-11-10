@@ -8,6 +8,24 @@
 import json
 import sys
 import os
+from urllib.parse import unquote
+
+
+def package_identity(package):
+    """Compare package identities, not colliding display names or versions."""
+    for ref in package.get("externalRefs", []):
+        if ref.get("referenceType") == "purl":
+            path = ref.get("referenceLocator", "").split("?", 1)[0].split("#", 1)[0]
+            if path.rfind("@") > path.rfind("/"):
+                path = path.rsplit("@", 1)[0]
+            if path.startswith("pkg:"):
+                return unquote(path)
+    return "name:" + package.get("name", "Unknown")
+
+
+def vulnerability_ids(vuln):
+    return {v.upper() for v in [vuln.get("id"), *(vuln.get("aliases") or []),
+                               *(vuln.get("upstream") or [])] if isinstance(v, str) and v}
 
 def load_scan_results(filepath):
     try:
@@ -64,8 +82,7 @@ def get_vuln_set(results):
             if not vuln_id:
                 continue
             
-            # Using (package_name, vuln_id) as identity
-            key = (pkg_name, vuln_id)
+            key = (package_identity(pkg), vuln_id)
             vuln_map[key] = {
                 "pkg_name": pkg_name,
                 "version": pkg_ver,
@@ -116,13 +133,18 @@ def main():
 
     master_map = get_vuln_set(master_data)
     pr_map = get_vuln_set(pr_data)
+    existing = {(identity, alias) for (identity, _), info in master_map.items()
+                for alias in vulnerability_ids(info["vuln"])}
+    reported = set()
 
     new_vulns = []
     ignored_vulns = []
 
     for key, info in pr_map.items():
-        if key in master_map:
+        identities = {(key[0], alias) for alias in vulnerability_ids(info["vuln"])}
+        if identities & (existing | reported):
             continue
+        reported.update(identities)
         if is_ignored(info["vuln"], ignore_ids):
             ignored_vulns.append(info)
             continue

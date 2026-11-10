@@ -2,3 +2,6 @@
 ci/.venv
 ci/out/
 TODO
+.venv/
+out/
+__pycache__/

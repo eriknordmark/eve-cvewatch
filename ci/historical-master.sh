@@ -176,32 +176,14 @@ get_sbom_for_month() {
             tried=$((tried + 1))
             log_info "  [$month_label] Trying commit #$tried: $sha ($commit_date): $commit_msg"
 
-            local image_name="${EVE_DOCKER_IMAGE_PREFIX}${sha}${EVE_DOCKER_IMAGE_SUFFIX}"
-
-            # Pull the image
-            if ! docker pull "$image_name" >/dev/null 2>&1; then
-                log_warn "  [$month_label] Docker pull failed for $sha, trying previous commit..."
+            if ! bash "$BASE_DIR/eve/get_sbom.sh" "master-$sha" "$sbom_dest"; then
+                log_warn "  [$month_label] SBOM unavailable for $sha, trying previous commit..."
                 continue
             fi
-
-            # Extract SBOM
-            if ! docker run --rm "$image_name" sbom > "$sbom_dest" 2>/dev/null; then
-                log_warn "  [$month_label] SBOM extraction failed for $sha, removing image..."
-                docker rmi "$image_name" >/dev/null 2>&1 || true
-                continue
-            fi
-
-            # Validate SBOM is not empty / valid JSON
-            if [ ! -s "$sbom_dest" ] || ! jq empty "$sbom_dest" 2>/dev/null; then
-                log_warn "  [$month_label] SBOM is empty or invalid for $sha, removing image..."
-                docker rmi "$image_name" >/dev/null 2>&1 || true
-                rm -f "$sbom_dest"
-                continue
-            fi
-
-            # Clean up docker image
-            log_info "  [$month_label] Removing docker image $image_name..."
-            docker rmi "$image_name" >/dev/null 2>&1 || log_warn "Failed to remove image $image_name"
+            # Bind cached bytes to the commit actually pulled, which may be
+            # older than the newest commit in this month.
+            jq -n --arg sha "$full_sha" --arg date "$commit_date" '{sha:$sha,date:$date}' > "$sbom_dest.commit.json.tmp"
+            mv "$sbom_dest.commit.json.tmp" "$sbom_dest.commit.json"
 
             # Success
             FOUND_COMMIT_SHA="$full_sha"
@@ -335,16 +317,12 @@ LOG_FILE="$LOG_DIR/historical-master.log"
 export LOG_FILE
 
 setup_environment
+exec 9>"$SCAN_DIR/.historical-scan.lock"
+flock -n 9 || { log_error "Another historical scan is using $SCAN_DIR"; exit 1; }
 if [ "$DRY_RUN" = false ]; then
     download_cvss_db "$CACHE_SOURCE_DIR"
 
-    # Clear the Python scanner's disk cache once at startup to avoid
-    # stale OSV query results from previous runs
-    PYTHON_CACHE_DIR="/tmp/cve_cache_$(date +%Y-%m-%d)"
-    if [ -d "$PYTHON_CACHE_DIR" ]; then
-        log_info "Clearing scanner disk cache: $PYTHON_CACHE_DIR"
-        rm -rf "$PYTHON_CACHE_DIR"
-    fi
+
 fi
 
 log_info "============================================================"
@@ -378,20 +356,19 @@ for TARGET_DATE in $MONTH_TARGETS; do
     FOUND_COMMIT_SHORT=""
     FOUND_COMMIT_DATE=""
 
-    if [ -f "$SBOM_PATH" ]; then
-        log_info "  SBOM already cached at $SBOM_PATH, skipping docker pull..."
-        # Fetch the latest commit in this month to get metadata for labelling
-        LATEST_PAGE=$(fetch_commits_page "${TARGET_DATE}T23:59:59Z" 1 2>/dev/null || echo "[]")
-        if [ "$(echo "$LATEST_PAGE" | jq 'length')" -gt 0 ]; then
-            FOUND_COMMIT_SHORT=$(echo "$LATEST_PAGE" | jq -r '.[0].sha' | cut -c 1-8)
-            FOUND_COMMIT_SHA=$(echo "$LATEST_PAGE" | jq -r '.[0].sha')
-            FOUND_COMMIT_DATE=$(echo "$LATEST_PAGE" | jq -r '.[0].commit.committer.date')
-        else
-            FOUND_COMMIT_SHORT="cached"
-            FOUND_COMMIT_SHA="cached"
-            FOUND_COMMIT_DATE="unknown"
+    if [ -s "$SBOM_PATH" ] && [ -f "$SBOM_PATH.commit.json" ] &&
+       jq -e '.sha | test("^[0-9a-f]{40}$")' "$SBOM_PATH.commit.json" >/dev/null 2>&1 &&
+       jq -e '.packages | type == "array" and length > 0' "$SBOM_PATH" >/dev/null 2>&1; then
+        FOUND_COMMIT_SHA=$(jq -r .sha "$SBOM_PATH.commit.json")
+        FOUND_COMMIT_SHORT="${FOUND_COMMIT_SHA:0:8}"
+        FOUND_COMMIT_DATE=$(jq -r .date "$SBOM_PATH.commit.json")
+        # A crash between SBOM replacement and metadata publication invalidates
+        # the cache; never relabel those bytes with another commit.
+        if [ "$(cat "$SBOM_PATH.image" 2>/dev/null || true)" != "lfedge/eve:0.0.0-master-$FOUND_COMMIT_SHORT-kvm-amd64" ]; then
+            FOUND_COMMIT_SHA=""
         fi
-    else
+    fi
+    if [ -z "$FOUND_COMMIT_SHA" ]; then
         if ! get_sbom_for_month "$MONTH_LABEL" "$TARGET_DATE" "$MONTH_START" "$SBOM_PATH"; then
             log_error "Could not get SBOM for $MONTH_LABEL from any merge commit, skipping..."
             FAILED=$((FAILED + 1))
@@ -429,8 +406,13 @@ for TARGET_DATE in $MONTH_TARGETS; do
         # Run scanner
         CVSS_BT_PATH="$CACHE_SOURCE_DIR/cvss-bt.csv"
 
+        if ! KERNEL_VERSION=$(get_kernel_version_for_commit "$FOUND_COMMIT_SHA" "$TEMP_DIR/kernel-source"); then
+            log_error "Could not resolve kernel for $FOUND_COMMIT_SHA"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
         log_info "  Running CVE scan for $SCAN_LABEL..."
-        if ! run_cve_scanner "$SCAN_LABEL" "$SBOM_PATH" "$DB_PATH" "$SCAN_DIR" "$CVSS_BT_PATH"; then
+        if ! run_cve_scanner "$SCAN_LABEL" "$SBOM_PATH" "$DB_PATH" "$SCAN_DIR" "$CVSS_BT_PATH" "$KERNEL_VERSION"; then
             log_error "  Scan failed for $SCAN_LABEL"
             FAILED=$((FAILED + 1))
             continue
@@ -440,7 +422,13 @@ for TARGET_DATE in $MONTH_TARGETS; do
         # Upload if enabled
         if [ "$UPLOAD" = true ]; then
             SCAN_FILE="${SCAN_DIR}/scan_results_${SCAN_LABEL}.json"
-            upload_scan "$SCAN_LABEL" "$SCAN_FILE" || log_warn "  Upload failed for $SCAN_LABEL, continuing..."
+            if upload_scan "$SCAN_LABEL" "$SCAN_FILE"; then
+                rm -f "$SCAN_FILE"
+            else
+                log_error "Upload failed for $SCAN_LABEL; retaining its result"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
         fi
     fi
 
@@ -458,11 +446,6 @@ log_info "  Failed:    $FAILED / $MONTH_COUNT"
 log_info "============================================================"
 
 if [ "$FAILED" -gt 0 ]; then
-    log_warn "Some months failed. Check the log for details: $LOG_FILE"
-fi
-
-# Clean up scan results after successful upload to avoid disk buildup
-if [ "$UPLOAD" = true ] && [ -d "$SCAN_DIR" ]; then
-    log_info "Cleaning up scan results in $SCAN_DIR..."
-    rm -rf "$SCAN_DIR"
+    log_error "Some months failed. Check the log for details: $LOG_FILE"
+    exit 1
 fi

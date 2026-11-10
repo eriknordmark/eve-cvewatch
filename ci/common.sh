@@ -75,7 +75,7 @@ setup_python_env() {
     fi
 
     log_info "Installing Python dependencies..."
-    pip3 install requests diskcache packaging
+    pip3 install -r "$(dirname "${BASH_SOURCE[0]}")/requirements.txt"
 }
 
 # Downloads the CVSS database
@@ -89,17 +89,26 @@ download_cvss_db() {
 
     log_info "Downloading cvss-bt.csv..."
     local download_url
-    download_url=$(curl -s "$cvss_url" | jq -r '.assets[0].browser_download_url')
-    
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        log_error "Failed to get cvss-bt download URL"
+    if ! download_url=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        --retry 2 --retry-all-errors --retry-max-time 90 "$cvss_url" | \
+        jq -er '[.assets[] | select(.name == "cvss-bt.csv")][0].browser_download_url'); then
+        log_error "Failed to resolve the CVSS database download"
         return 1
     fi
-    
-    if ! curl -L -f -o "$target_file" "$download_url"; then
-        log_error "Failed to download cvss-bt.csv"
+    if [[ "$download_url" != https://* ]]; then
+        log_error "Invalid CVSS database URL"
         return 1
     fi
+    local download_tmp
+    download_tmp=$(mktemp "${target_file}.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 300 \
+        --retry 2 --retry-all-errors --retry-max-time 600 \
+        -o "$download_tmp" "$download_url"; then
+        rm -f "$download_tmp"
+        log_error "Failed to download CVSS database"
+        return 1
+    fi
+    mv "$download_tmp" "$target_file"
     log_info "Successfully downloaded cvss-bt.csv to $cache_dir"
 }
 
@@ -108,8 +117,8 @@ download_cvss_db() {
 #   $1: The tag or branch name (e.g., "master" or "10.4.5-lts")
 get_remote_alpine_version() {
     local tag="$1"
-    if [[ "$tag" == *"master"* ]]; then
-        tag="master"
+    if [[ "$tag" =~ ^master-([0-9a-f]{8,40})$ ]]; then
+        tag="${BASH_REMATCH[1]}"
     fi
 
     local file_path="pkg/alpine/Dockerfile"
@@ -172,6 +181,11 @@ run_cve_scanner() {
     local db_path="$3"
     local output_dir="$4"
     local cvss_bt_path="${5:-out/cache/data-source/cvss-bt.csv}"
+    local kernel_version="${6:-}"
+    local extra_args=()
+    if [ -n "$kernel_version" ]; then
+        extra_args+=(--kernel-version "$kernel_version")
+    fi
 
     log_info "Running scanner for $eve_arg..."
     # Locate scanner script relative to this common.sh file
@@ -184,7 +198,7 @@ run_cve_scanner() {
         return 1
     fi
 
-    if ! log_cmd python3 "$scanner_script" "$eve_arg" "$sbom_path" "$cvss_bt_path" "$db_path" "$output_dir"; then
+    if ! log_cmd python3 "$scanner_script" "$eve_arg" "$sbom_path" "$cvss_bt_path" "$db_path" "$output_dir" "${extra_args[@]}"; then
         log_error "Scanner failed for $eve_arg"
         return 1
     fi
@@ -223,4 +237,36 @@ cleanup_files() {
             rm -f "$path"
         fi
     done
+}
+
+# Evaluate kernel metadata in an already checked-out source tree. Only build
+# jobs call this; the fresh scan job never executes artifact-provided makefiles.
+get_source_kernel_version() {
+    local kernel_version
+    kernel_version=$(make --no-print-directory -s -f - HV=kvm PLATFORM=generic ZARCH=amd64 cvewatch_kernel <<'MAKE'
+include kernel-version.mk
+.PHONY: cvewatch_kernel
+cvewatch_kernel:
+	@echo $(KERNEL_VERSION)
+MAKE
+    ) || return 1
+    [[ "$kernel_version" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    printf '%s\n' "$kernel_version"
+}
+
+# Historical scans need metadata from their recorded commit, never today's
+# master. A sparse checkout fetches only the kernel metadata files.
+get_kernel_version_for_commit() {
+    local sha="$1"
+    local source_dir="$2"
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    if [ ! -d "$source_dir/.git" ]; then
+        git init -q "$source_dir" || return 1
+        git -C "$source_dir" remote add origin https://github.com/lf-edge/eve.git || return 1
+        git -C "$source_dir" sparse-checkout init --no-cone || return 1
+        git -C "$source_dir" sparse-checkout set /kernel-version.mk /kernel-commits.mk || return 1
+    fi
+    git -C "$source_dir" fetch --quiet --depth 1 --filter=blob:none origin "$sha" || return 1
+    git -C "$source_dir" checkout --quiet --detach FETCH_HEAD || return 1
+    (cd "$source_dir" && get_source_kernel_version)
 }
