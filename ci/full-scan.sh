@@ -84,13 +84,14 @@ fetch_eve_tags() {
     # get master
     log_info "Fetching latest master commit..." >&2
     local latest_commit_hash
-    latest_commit_hash=$(curl -s $EVE_COMMITS_URL | jq -r '.sha' | cut -c 1-8)
-    if [ -z "$latest_commit_hash" ] || [ "$latest_commit_hash" = "null" ]; then
+    latest_commit_hash=$(curl -fsS "$EVE_COMMITS_URL" | jq -er '.sha')
+    if [[ ! "$latest_commit_hash" =~ ^[0-9a-f]{40}$ ]]; then
         log_error "Failed to fetch the latest commit hash"
         popd > /dev/null
         return 1
     fi
-    local master_tag="master-$latest_commit_hash"
+    echo "$latest_commit_hash" > "$TEMP_DIR/master-sha"
+    local master_tag="master-${latest_commit_hash:0:8}"
     log_info "Latest master: $master_tag" >&2
 
     popd > /dev/null
@@ -102,11 +103,7 @@ prefetch_alpine_versions() {
     local tags="$1"
     for tag in $tags; do
         local eve_arg
-        if [[ "$tag" == master-* ]]; then
-            eve_arg="master"
-        else
-            eve_arg="$tag"
-        fi
+        eve_arg="$tag"
         
         log_info "Pre-fetching Alpine version for $tag..."
         local alpine_version
@@ -125,11 +122,7 @@ prep_tags() {
     log_info "=== Processing tag: $tag ==="
     
     local eve_arg
-    if [[ "$tag" == master-* ]]; then
-        eve_arg="master"
-    else
-        eve_arg="$tag"
-    fi
+    eve_arg="$tag"
     
     local alpine_tag
     alpine_tag=$(grep "^${tag}|" "$ALPINE_CACHE" | cut -d'|' -f2)
@@ -152,9 +145,20 @@ prep_tags() {
     fi
     
     log_info "  - Getting SBOM..."
-    if ! log_cmd bash eve/get_sbom.sh "$eve_arg" "$sbom_path"; then
-        log_warn "Failed to get SBOM for $tag"
+    if ! log_cmd bash "$SCRIPT_DIR/eve/get_sbom.sh" "$eve_arg" "$sbom_path"; then
+        log_error "Failed to get SBOM for $tag"
+        return 1
     fi
+    # Retain exact kernel metadata even when the image SBOM omits the kernel.
+    local ref="${tag#master-}"
+    if [[ "$tag" == master-* ]]; then
+        ref=$(cat "$TEMP_DIR/master-sha")
+        [[ "$ref" =~ ^[0-9a-f]{40}$ && "master-${ref:0:8}" = "$tag" ]] || return 1
+    fi
+    git -C "$TEMP_DIR/eve_clone" fetch origin "$ref" || return 1
+    git -C "$TEMP_DIR/eve_clone" checkout --detach FETCH_HEAD || return 1
+    mkdir -p "$TEMP_DIR/kernels"
+    (cd "$TEMP_DIR/eve_clone" && get_source_kernel_version) > "$TEMP_DIR/kernels/$tag" || return 1
 }
 
 run_scanner() {
@@ -185,7 +189,7 @@ run_scanner() {
     log_info "  - SBOM path: $sbom_path"
     
     log_info "  - Running scanner..."
-    if ! run_cve_scanner "$eve_arg" "$sbom_path" "$db_path" "$SCAN_DIR" "$cvss_bt_path"; then
+    if ! run_cve_scanner "$eve_arg" "$sbom_path" "$db_path" "$SCAN_DIR" "$cvss_bt_path" "$(cat "$TEMP_DIR/kernels/$tag")"; then
         log_warn "Scanner failed for $tag"
         return 1
     fi
@@ -272,15 +276,9 @@ LOG_FILE="$LOG_DIR/full-scan.log"
 export LOG_FILE
 
 setup_environment
+exec 9>"$SCAN_DIR/.full-scan.lock"
+flock -n 9 || { log_error "Another full scan is using $SCAN_DIR"; exit 1; }
 download_cvss_db "$CACHE_SOURCE_DIR" "$CVSS_BT_URL"
-
-# Clear the Python scanner's disk cache once at startup to avoid
-# stale OSV query results from previous runs
-PYTHON_CACHE_DIR="/tmp/cve_cache_$(date +%Y-%m-%d)"
-if [ -d "$PYTHON_CACHE_DIR" ]; then
-    log_info "Clearing scanner disk cache: $PYTHON_CACHE_DIR"
-    rm -rf "$PYTHON_CACHE_DIR"
-fi
 
 # fetch all eve lts tags + master
 log_info "Fetching EVE tags..."
@@ -305,17 +303,15 @@ if [ "$FETCH_ONLY" = true ]; then
 fi
 
 log_info "Start CVE scanning..."
+FAILED=0
 if [ "$PARALLEL" = true ]; then
   log_info "Running scanners in parallel..."
   PIDS=()
   TAG_ARRAY=()
+  SUCCESSFUL_TAGS=()
   
   for TAG in $ALL_TAGS; do
-    if [[ "$TAG" == master-* ]]; then
-      EVE_ARG="master"
-    else
-      EVE_ARG="$TAG"
-    fi
+    EVE_ARG="$TAG"
     SBOM_PATH="out/cache/sbom/eve-sbom-${TAG}.json"
     
     (
@@ -336,6 +332,7 @@ if [ "$PARALLEL" = true ]; then
     TAG=${TAG_ARRAY[$i]}
     if wait $PID; then
       log_info "✓ Scanner for $TAG completed successfully"
+      SUCCESSFUL_TAGS+=("$TAG")
     else
       log_error "✗ Scanner for $TAG failed (check ${LOG_DIR}/scanner-${TAG}.log)"
       FAILED=$((FAILED + 1))
@@ -351,23 +348,28 @@ if [ "$PARALLEL" = true ]; then
   # Upload scans if --upload is enabled
   if [ "$UPLOAD" = true ]; then
     log_info "Uploading scan results..."
-    for TAG in $ALL_TAGS; do
+    for TAG in "${SUCCESSFUL_TAGS[@]}"; do
       if [[ "$TAG" == master-* ]]; then
-        EVE_ARG="master"
+        EVE_ARG="$TAG"
         IS_MASTER=true
       else
         EVE_ARG="$TAG"
         IS_MASTER=false
       fi
       SCAN_FILE="${SCAN_DIR}/scan_results_${EVE_ARG}.json"
-      upload_scan "$TAG" "$SCAN_FILE" "$IS_MASTER" || log_warn "Upload failed for $TAG, continuing..."
+      if upload_scan "$TAG" "$SCAN_FILE" "$IS_MASTER"; then
+        rm -f "$SCAN_FILE"
+      else
+        log_error "Upload failed for $TAG; retaining its result"
+        FAILED=$((FAILED + 1))
+      fi
     done
   fi
 else
   for TAG in $ALL_TAGS; do
     log_info "=== Scanning tag: $TAG ==="
     if [[ "$TAG" == master-* ]]; then
-      EVE_ARG="master"
+      EVE_ARG="$TAG"
       IS_MASTER=true
     else
       EVE_ARG="$TAG"
@@ -379,15 +381,20 @@ else
      # Upload scan if --upload is enabled
      if [ "$UPLOAD" = true ]; then
        SCAN_FILE="${SCAN_DIR}/scan_results_${EVE_ARG}.json"
-       upload_scan "$TAG" "$SCAN_FILE" "$IS_MASTER" || log_warn "Upload failed for $TAG, continuing..."
+       if upload_scan "$TAG" "$SCAN_FILE" "$IS_MASTER"; then
+         rm -f "$SCAN_FILE"
+       else
+         log_error "Upload failed for $TAG; retaining its result"
+         FAILED=$((FAILED + 1))
+       fi
      fi
   done
   
   log_info "All processing completed!"
 fi
 
-# Clean up scan results after successful upload to avoid disk buildup
-if [ "$UPLOAD" = true ] && [ -d "$SCAN_DIR" ]; then
-    log_info "Cleaning up scan results in $SCAN_DIR..."
-    rm -rf "$SCAN_DIR"
+# Parallel scan/upload failures must propagate to cron/CI. Only successfully
+# uploaded files were removed above; failed results remain available for retry.
+if [ "${FAILED:-0}" -ne 0 ]; then
+    exit 1
 fi

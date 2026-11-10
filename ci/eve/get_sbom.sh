@@ -1,93 +1,48 @@
 #!/bin/bash
-#
 # Copyright (c) 2026 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Retrieve Software Bill of Materials (SBOM) from EVE-OS Docker images.
-# Pulls the specified EVE image, extracts the SPDX SBOM, and saves it locally.
+# Extract an SBOM without ever publishing a truncated cached result.
 set -euo pipefail
-
-# Directories
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CI_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Source common functions if available
-if [ -f "$CI_DIR/common.sh" ]; then
-    source "$CI_DIR/common.sh"
-fi
-
-EVE_TAG="${1:-}"
-SBOM_PATH="${2:-}"
-
-if [ -z "$EVE_TAG" ] || [ -z "$SBOM_PATH" ]; then
-    log_error "EVE tag and SBOM path are required"
-    log_error "Usage: $0 <EVE_TAG> <SBOM_PATH>"
-    exit 1
-fi
-
-EVE_COMMITS_URL="https://api.github.com/repos/lf-edge/eve/commits/master"
-
-# create directory if needed
+source "$SCRIPT_DIR/../common.sh"
+EVE_TAG="${1:?EVE tag required}"
+SBOM_PATH="${2:?SBOM path required}"
 mkdir -p "$(dirname "$SBOM_PATH")"
 
-# handle master branch
-if [[ "$EVE_TAG" == "master" ]]; then
-    log_info "Fetching latest master commit..."
-    latest_commit_hash=$(curl -s $EVE_COMMITS_URL | jq -r '.sha' | cut -c 1-8)
-    if [ -z "$latest_commit_hash" ] || [ "$latest_commit_hash" = "null" ]; then
-        log_error "Failed to fetch the latest commit hash"
-        exit 1
-    fi
-
-    TAG="master-$latest_commit_hash"
-  
-    if [ -f "$SBOM_PATH" ]; then
-        log_info "SKIP: SBOM already exists at $SBOM_PATH"
-        exit 0
-    fi
-  
-    log_info "Processing master: $TAG"
-
-    full_image_name="lfedge/eve:0.0.0-master-$latest_commit_hash-kvm-amd64"
-    log_info "Pulling docker image: $full_image_name"
-    if ! docker pull "$full_image_name"; then
-        log_error "Failed to pull docker image for master $latest_commit_hash"
-        exit 1
-    fi
-
-    if ! docker run --rm "$full_image_name" sbom > $SBOM_PATH; then
-        log_error "Failed to generate SBOM for master $latest_commit_hash"
-        exit 1
-    fi
-
-    if ! docker rmi "$full_image_name"; then
-        log_warn "Failed to remove docker image for master $latest_commit_hash"
-    fi
-
-    log_info "Successfully saved SBOM for master-$latest_commit_hash"
+if [ "$EVE_TAG" = master ]; then
+    sha=$(curl -fsS 'https://api.github.com/repos/lf-edge/eve/commits/master' | jq -er .sha)
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { log_error 'Invalid master SHA'; exit 1; }
+    EVE_TAG="master-${sha:0:8}"
+fi
+if [[ "$EVE_TAG" =~ ^master-([0-9a-f]{8,40})$ ]]; then
+    image="lfedge/eve:0.0.0-master-${BASH_REMATCH[1]:0:8}-kvm-amd64"
+else
+    image="lfedge/eve:$EVE_TAG"
+fi
+# A cache entry is valid only for the same immutable image identity.
+if [ -s "$SBOM_PATH" ] && [ -f "$SBOM_PATH.image" ] &&
+   [ "$(cat "$SBOM_PATH.image")" = "$image" ] &&
+   jq -e '.packages | type == "array" and length > 0' "$SBOM_PATH" >/dev/null 2>&1; then
+    log_info "Using cached SBOM for $image"
     exit 0
 fi
-
-# handle LTS tag
-if [ -f "$SBOM_PATH" ]; then
-    log_info "SKIP: SBOM already exists at $SBOM_PATH"
-    exit 0
+sbom_tmp=$(mktemp "${SBOM_PATH}.XXXXXX")
+remove_image=false
+cleanup() {
+    rm -f "$sbom_tmp"
+    if [ "$remove_image" = true ]; then
+        docker rmi "$image" >/dev/null 2>&1 || log_warn "Could not remove $image"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+    remove_image=true
 fi
-
-log_info "Processing LTS tag: $EVE_TAG"
-
-if ! docker pull lfedge/eve:$EVE_TAG; then
-    log_error "Failed to pull docker image for tag $EVE_TAG"
-    exit 1
-fi
-
-if ! docker run --rm lfedge/eve:$EVE_TAG sbom > $SBOM_PATH; then
-    log_error "Failed to generate SBOM for tag $EVE_TAG"
-    exit 1
-fi
-
-if ! docker rmi lfedge/eve:$EVE_TAG; then
-    log_warn "Failed to remove docker image for tag $EVE_TAG"
-fi
-
-log_info "Successfully saved SBOM for tag $EVE_TAG"
+docker pull "$image"
+docker run --rm "$image" sbom > "$sbom_tmp"
+jq -e '.packages | type == "array" and length > 0' "$sbom_tmp" >/dev/null
+mv "$sbom_tmp" "$SBOM_PATH"
+printf '%s\n' "$image" > "$SBOM_PATH.image"
+log_info "Saved SBOM for $image"

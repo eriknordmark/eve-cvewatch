@@ -2,103 +2,84 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Scan SPDX SBOM files for known vulnerabilities using the OSV database.
-# Queries the OSV API for each package and caches results for efficient
-# parallel execution across multiple runs.
+# Queries the OSV API for each package and caches the results (8h TTL) so
+# consecutive runs reuse them.
 
 import requests
+import argparse
+import copy
 import json
+import logging
 import re
 import time
 import random
-import sys
 import os
-from datetime import datetime
+import tempfile
 from diskcache import Cache
 import csv
 import zipfile
-import io
+from urllib.parse import parse_qs, unquote, urlsplit
 from packaging import version as packaging_version
 
-PATH_PATTERN = re.compile(r'[\w./-]+(?:/\w+)+')
+log = logging.getLogger("scan")
 
-def extract_package_info(package):
-    # base on https://ossf.github.io/osv-schema/#affectedpackage-field
+# OSV query results are cached for 8h so consecutive scans in one session reuse
+# them, but the next day's scan always re-queries — otherwise we'd miss CVEs
+# published overnight for a package (the cache must expire well within 24h).
+OSV_CACHE_TTL_SECONDS = 8 * 3600
+
+# sentinel to tell a cache miss apart from a cached empty result
+_CACHE_MISS = object()
+
+
+class ScanError(RuntimeError):
+    """The scan is incomplete and must not pass a vulnerability gate."""
+
+def extract_package_info(package, alpine_version=None):
     name = package.get("name", "Unknown")
-    version = package.get("versionInfo", None)
-    source_info = package.get("sourceInfo", None)
-    package_file_name = package.get("packageFileName", None)
-    description = package.get("description", None)
-    external_refs = package.get("externalRefs", [])
-    
-    # extract PURL from externalRefs and remove version
-    purl = None
-    purl_raw = None
-    for ref in external_refs:
-        if ref.get("referenceType") == "purl":
-            purl_raw = ref.get("referenceLocator", "")
-            # strip version from PURL (remove @version part)
-            if "@" in purl_raw:
-                purl = purl_raw.split("@")[0]
-            else:
-                purl = purl_raw
-            break
-    
+    version = package.get("versionInfo")
+    raw = next((r.get("referenceLocator", "") for r in package.get("externalRefs", [])
+                if r.get("referenceType") == "purl"), "")
+    path = raw.split("#", 1)[0].split("?", 1)[0]
+    # A scoped npm name contains @ before the last slash; that is not a version.
+    if path.rfind("@") > path.rfind("/"):
+        path = path.rsplit("@", 1)[0]
+    qualifiers = parse_qs(urlsplit(raw).query)
+    purl = path or None
     ecosystem = None
-    if purl:
-        if purl.startswith("pkg:apk/"):
-            ecosystem = "Alpine"
-        elif purl.startswith("pkg:golang/"):
+    kind = path.removeprefix("pkg:").split("/", 1)[0]
+    ecosystems = {"golang": "Go", "npm": "npm", "pypi": "PyPI", "maven": "Maven",
+                  "gem": "RubyGems", "cargo": "crates.io", "nuget": "NuGet", "hex": "Hex", "pub": "Pub"}
+    if kind == "apk":
+        release = qualifiers.get("distro", [""])[0]
+        match = re.fullmatch(r"alpine-(\d+\.\d+)(?:\.\d+)?", release)
+        alpine_version = "v" + match[1] if match else alpine_version
+        ecosystem = "Alpine:" + alpine_version if alpine_version else "Alpine"
+    elif kind == "deb":
+        match = re.fullmatch(r"debian-(\d+)(?:\.\d+)?", qualifiers.get("distro", [""])[0])
+        ecosystem = "Debian:" + match[1] if match else "Debian"
+    elif kind in ecosystems:
+        ecosystem = ecosystems[kind]
+    elif kind == "generic" and path.rsplit("/", 1)[-1] in ("kernel", "linux", "linux-kernel"):
+        ecosystem = "Linux"
+    if kind in ("apk", "deb"):
+        origin = qualifiers.get("upstream", [])
+        if len(origin) == 1:
+            name = origin[0].split("@", 1)[0]
+    if not ecosystem:
+        source = (package.get("sourceInfo") or "").lower()
+        if "apk db" in source:
+            ecosystem = "Alpine:" + alpine_version if alpine_version else "Alpine"
+        elif "go module" in source:
             ecosystem = "Go"
-        elif purl.startswith("pkg:npm/"):
-            ecosystem = "npm"
-        elif purl.startswith("pkg:pypi/"):
-            ecosystem = "PyPI"
-        elif purl.startswith("pkg:maven/"):
-            ecosystem = "Maven"
-        elif purl.startswith("pkg:gem/"):
-            ecosystem = "RubyGems"
-        elif purl.startswith("pkg:cargo/"):
-            ecosystem = "crates.io"
-        elif purl.startswith("pkg:nuget/"):
-            ecosystem = "NuGet"
-        elif purl.startswith("pkg:hex/"):
-            ecosystem = "Hex"
-        elif purl.startswith("pkg:pub/"):
-            ecosystem = "Pub"
-        elif "kernel" in purl.lower():
-            ecosystem = "Linux"
-
-    # if still no luck, try sourceInfo
-    # XXX: maybe SPDXID is better source?
-    if not ecosystem and source_info:
-        if "apk db" in source_info.lower():
-            ecosystem = "Alpine"
-        elif "go module" in source_info.lower():
-            ecosystem = "Go"
-    
-    # for Go packages, extract module path as name
-    if ecosystem == "Go" and purl and purl.startswith("pkg:golang/"):
-        go_path = purl.replace("pkg:golang/", "")
-        if "#" in go_path:
-            # handle subpackages
-            module_path, subpkg = go_path.split("#", 1)
-            name = f"{module_path}/{subpkg}"
-        else:
-            name = go_path
-    
-    # for Linux kernel, name should be "Kernel"
+    if ecosystem == "Go" and path.startswith("pkg:golang/"):
+        name = unquote(path.removeprefix("pkg:golang/"))
+    if name in ("Kernel", "Linux"):
+        ecosystem = "Linux"
     if ecosystem == "Linux":
         name = "Kernel"
-    
-    return {
-        "name": name,
-        "version": version,
-        "purl": purl,
-        "ecosystem": ecosystem,
-        "sourceInfo": source_info,
-        "packageFileName": package_file_name,
-        "description": description
-    }
+    return {"name": name, "version": version, "purl": purl, "ecosystem": ecosystem,
+            **{k: package.get(k) for k in ("sourceInfo", "packageFileName", "description")}}
 
 def parse_spdx(file_path):
     packages = []
@@ -107,7 +88,7 @@ def parse_spdx(file_path):
             spdx_data = json.load(file)
         
         if "packages" not in spdx_data or not spdx_data["packages"]:
-            print("No packages found in SPDX file.")
+            log.info("No packages found in SPDX file.")
             return None
         
         for package in spdx_data["packages"]:
@@ -153,82 +134,19 @@ def parse_spdx(file_path):
             packages.append(package_info)
             
     except FileNotFoundError:
-        print(f"Error: SPDX file not found: {file_path}")
+        log.error(f"Error: SPDX file not found: {file_path}")
         return None
     except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in SPDX file: {e}")
+        log.error(f"Error: Invalid JSON in SPDX file: {e}")
         return None
     except Exception as e:
-        print(f"Error reading SPDX file: {e}")
+        log.error(f"Error reading SPDX file: {e}")
         return None
     
     return packages
 
-def load_alpine_db(db_path):
-    alpine_db = {}
-    alpine_db_by_cpe = {}
-    try:
-        with open(db_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-            for pkg in data:
-                secfixes = pkg.get("secfixes", [])
-                
-                # Index by package name
-                if "pkgname" in pkg:
-                    alpine_db[pkg["pkgname"]] = secfixes
-                
-                # Index by CPE values (without version for broader matching)
-                if "cpe_alpine" in pkg and pkg["cpe_alpine"]:
-                    alpine_db_by_cpe[pkg["cpe_alpine"]] = secfixes
-                if "cpe_vendor" in pkg and pkg["cpe_vendor"]:
-                    alpine_db_by_cpe[pkg["cpe_vendor"]] = secfixes
-                    
-        print(f"Loaded {len(alpine_db)} packages from Alpine DB: {db_path}")
-        print(f"Loaded {len(alpine_db_by_cpe)} CPE entries from Alpine DB")
-    except FileNotFoundError:
-        print(f"Warning: Alpine DB file not found: {db_path}")
-        alpine_db_by_cpe = {}
-    except Exception as e:
-        print(f"Error loading Alpine DB: {e}")
-        alpine_db_by_cpe = {}
-    
-    return alpine_db, alpine_db_by_cpe
 
-def get_secfixes_for_package(pkg_info, alpine_db, alpine_db_by_cpe):
-    pkg_name = pkg_info.get('name', '')
-    
-    # Try by package name first
-    secfixes = alpine_db.get(pkg_name, [])
-    if secfixes:
-        return secfixes
-    
-    # Try by CPE from external refs if name lookup returned nothing
-    external_refs = pkg_info.get('externalRefs', [])
-    for ref in external_refs:
-        if ref.get('referenceType') == 'cpe23Type':
-            cpe = ref.get('referenceLocator', '')
-            if cpe:
-                # Try exact CPE match
-                secfixes = alpine_db_by_cpe.get(cpe, [])
-                if secfixes:
-                    print(f"    Found secfixes via exact CPE match: {cpe}")
-                    return secfixes
-                
-                # Try matching against both cpe_alpine and cpe_vendor patterns
-                # by checking if any indexed CPE starts with the same base pattern
-                cpe_base = ':'.join(cpe.split(':')[:5])  # Get cpe:2.3:a:vendor:product part
-                for indexed_cpe, indexed_secfixes in alpine_db_by_cpe.items():
-                    # Check if keys have the same base (first 5 segments)
-                    if indexed_cpe.startswith(cpe_base):
-                        return indexed_secfixes
-                    # Handle case where indexed_cpe is shorter (e.g. less specific)
-                    if len(indexed_cpe) < len(cpe_base) and cpe.startswith(indexed_cpe):
-                         if len(cpe) == len(indexed_cpe) or cpe[len(indexed_cpe)] == ':':
-                             return indexed_secfixes
-    
-    return []
-
-def load_cvss_bt_cache(csv_path="out/cache/data-source/cvss-bt.csv"):
+def load_cvss_bt_cache(csv_path):
     cvss_bt_data = {}
     try:
         with open(csv_path, "r", encoding="utf-8") as file:
@@ -237,437 +155,386 @@ def load_cvss_bt_cache(csv_path="out/cache/data-source/cvss-bt.csv"):
                 cve_id = row.get("CVE") or row.get("cve")
                 if cve_id:
                     cvss_bt_data[cve_id.lower()] = row
-        print(f"Loaded {len(cvss_bt_data)} CVSS BT entries from {csv_path}")
+        log.info(f"Loaded {len(cvss_bt_data)} CVSS BT entries from {csv_path}")
     except FileNotFoundError:
-        print(f"Warning: CVSS BT file not found: {csv_path}")
+        log.warning(f"Warning: CVSS BT file not found: {csv_path}")
     except Exception as e:
-        print(f"Error loading CVSS BT data: {e}")
+        log.error(f"Error loading CVSS BT data: {e}")
     
     return cvss_bt_data
 
-def get_osv_vulnerabilities(name=None, version=None, ecosystem=None, purl=None, max_pages=100):
-    """Note: Use either (name + ecosystem) OR purl, but not both."""
-    url = "https://api.osv.dev/v1/query"
-    payload = {}
-    
-    if purl:
-        # when using purl, do NOT include name or ecosystem
-        payload["package"] = {"purl": purl}
-    elif name and ecosystem:
-        # when using name, ecosystem is required
-        payload["package"] = {
-            "name": name,
-            "ecosystem": ecosystem
-        }
-    else:
-        print("Error: Must provide either (name AND ecosystem) OR purl")
-        return None
-    
-    if version:
-        payload["version"] = version
-    
-    all_vulns = []
-    page_token = None
-    page_count = 0
-    try:
-        while page_count < max_pages:
-            page_count += 1
-            # add page_token if we're fetching subsequent pages
-            if page_token:
-                payload["page_token"] = page_token
-            elif "page_token" in payload:
-                # Remove page_token from payload if we're back to first page
-                del payload["page_token"]
-            
+_OSV_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _osv_post(url, payload, max_retries=5):
+    """POST to OSV, retrying on 429/5xx and network errors with exponential
+    backoff. Returns the 200 response, or None if it ultimately fails."""
+    delay = 1.0
+    for attempt in range(max_retries):
+        response = None
+        try:
             response = requests.post(url, json=payload, timeout=30)
-            if response.status_code != 200:
-                print(f"Error: HTTP {response.status_code}")
-                if response.text:
-                    print(f"Response: {response.text[:200]}")
-                return None
-            
-            data = response.json()
-            if "vulns" in data and data["vulns"]:
-                all_vulns.extend(data["vulns"])
-            elif "next_page_token" in data and data["next_page_token"]:
-                # Rare case: only page token, no vulnerabilities yet (API timeout)
-                print(f"  Page {page_count}: no vulns yet, continuing with next page token...")
-            
-            # Check if there are more pages
-            if "next_page_token" in data and data["next_page_token"]:
-                page_token = data["next_page_token"]
-            else:
-                break
-        
-        if page_count >= max_pages:
-            print(f"Warning: Reached max page limit ({max_pages})")
-        
-        return {"vulns": all_vulns} if all_vulns else {}
-        
-    except requests.exceptions.Timeout:
-        print(f"Error: Request timed out after fetching {len(all_vulns)} vulnerabilities")
-        return {"vulns": all_vulns} if all_vulns else None
-    except Exception as e:
-        print(f"Error querying OSV API: {e}")
-        return {"vulns": all_vulns} if all_vulns else None
+        except requests.exceptions.RequestException as e:
+            log.debug(f"OSV request error (attempt {attempt + 1}/{max_retries}): {e}")
 
-def load_linux_kernel_db(cache_dir="out/cache/osv"):
-    """Download (or use cached) Linux kernel vulnerability zip.
-    Returns the path to the zip file, or None on failure."""
-    os.makedirs(cache_dir, exist_ok=True)
-    zip_path = os.path.join(cache_dir, "Linux_all.zip")
-    url = "https://osv-vulnerabilities.storage.googleapis.com/Linux/all.zip"
-    
-    should_download = True
-    if os.path.exists(zip_path):
-        # Check if file is older than 8 hours
-        file_age = time.time() - os.path.getmtime(zip_path)
-        if file_age < 28800:
-            should_download = False
-            print(f"Using cached Linux DB (age: {file_age/3600:.1f} hours)")
-    
-    if should_download:
-        print(f"Downloading Linux DB from {url}...")
-        try:
-            response = requests.get(url, timeout=120, stream=True)
+        if response is not None:
             if response.status_code == 200:
-                with open(zip_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=65536):
-                        f.write(chunk)
-            else:
-                print(f"Error downloading Linux DB: {response.status_code}")
-                if not os.path.exists(zip_path):
-                    return None
-        except Exception as e:
-            print(f"Exception downloading Linux DB: {e}")
-            if not os.path.exists(zip_path):
+                return response
+            if response.status_code not in _OSV_RETRY_STATUS:
+                log.warning(f"OSV HTTP {response.status_code}: "
+                            f"{response.text[:200] if response.text else ''}")
                 return None
+            log.debug(f"OSV HTTP {response.status_code}, retrying "
+                      f"(attempt {attempt + 1}/{max_retries})")
 
-    return zip_path
+        if attempt < max_retries - 1:
+            time.sleep(delay + random.uniform(0, 0.3))
+            delay *= 2
+
+    log.warning(f"OSV request failed after {max_retries} attempts")
+    return None
 
 
-# this is hacky 
-def get_eve_kernel_version(eve_tag):
-    ref = eve_tag
-    if eve_tag.startswith("master"):
-        ref = "master"
-    
-    urls = [
-        f"https://raw.githubusercontent.com/lf-edge/eve/{ref}/kernel-version.mk",
-        f"https://raw.githubusercontent.com/lf-edge/eve/refs/tags/{ref}/kernel-version.mk"
-    ]
-    
-    content = None
-    for url in urls:
-        print(f"Fetching kernel version from {url}...")
+def _is_go_toolchain(name=None, ecosystem=None, purl=None):
+    if purl:
+        package = purl.split("?", 1)[0].split("#", 1)[0].split("@", 1)[0]
+        return package in ("pkg:golang/stdlib", "pkg:golang/toolchain")
+    return ecosystem == "Go" and name in ("stdlib", "toolchain")
+
+
+def _go_osv_version(version):
+    """Convert Go build-info versions to OSV semver, without changing the SBOM.
+
+    Sending e.g. go1.26.10 to OSV can return the entire stdlib advisory list.
+    Unknown/development builds must not become unversioned queries either.
+    """
+    if not isinstance(version, str):
+        raise ValueError("missing Go toolchain version")
+    if version == "go1":
+        return "1.0.0"
+    match = re.fullmatch(
+        r"(?:go|v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+        r"(?:\.(0|[1-9][0-9]*))?(?:(?:-?)(beta|rc|pre)\.?([1-9][0-9]*))?",
+        version,
+    )
+    if not match:
+        raise ValueError(f"unsupported Go toolchain version: {version!r}")
+    major, minor, patch, prerelease, number = match.groups()
+    result = f"{major}.{minor}.{patch or '0'}"
+    if prerelease:
+        result += f"-{prerelease}.{number}"
+    return result
+
+
+def get_osv_vulnerabilities(name=None, version=None, ecosystem=None, purl=None, max_pages=100):
+    """Return a complete query response, or None. Never return partial pages."""
+    if _is_go_toolchain(name, ecosystem, purl):
         try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                content = resp.text
-                break
-        except Exception as e:
-            print(f"Warning: Failed to fetch {url}: {e}")
-            
-    if not content:
-        print("Error: Could not fetch kernel-version.mk")
+            version = _go_osv_version(version)
+        except ValueError as exc:
+            log.error("Go advisory coverage unresolved: %s", exc)
+            return None
+    if not version:
+        log.warning("Cannot query unversioned package %s", name or purl)
         return None
-    
-    lines = content.split('\n')
-    in_amd64 = False
-    kernel_ver = None
-    
-    for line in lines:
-        line = line.strip()
-        # Detect start of amd64 block
-        if line.startswith('ifeq') and 'amd64' in line and 'ZARCH' in line:
-            in_amd64 = True
-            continue
-        # Skip non-amd64 ZARCH blocks
-        if line.startswith('ifeq') and 'ZARCH' in line and not in_amd64:
-            pass 
-            
-        if in_amd64:
-            # Stop if we hit another ZARCH block (e.g. else ifeq ($(ZARCH), arm64))
-            if 'ZARCH' in line and ('else' in line or 'ifeq' in line):
-                break
-                
-            if line.startswith('KERNEL_VERSION='):
-                val = line.split('=')[1].strip()
-                if val:
-                    kernel_ver = val
+    if purl:
+        package = {"purl": purl}
+    elif name and ecosystem:
+        package = {"name": name, "ecosystem": ecosystem}
+    else:
+        return None
+    payload = {"package": package, "version": version}
+    all_vulns, seen = [], set()
+    try:
+        for _ in range(max_pages):
+            response = _osv_post("https://api.osv.dev/v1/query", payload)
+            if response is None:
+                return None
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("vulns", []), list):
+                raise ValueError("invalid OSV response")
+            page = data.get("vulns", [])
+            if not all(isinstance(v, dict) and isinstance(v.get("id"), str) for v in page):
+                raise ValueError("invalid advisory record")
+            all_vulns.extend(page)
+            token = data.get("next_page_token")
+            if not token:
+                return {"vulns": all_vulns} if all_vulns else {}
+            if not isinstance(token, str) or token in seen:
+                raise ValueError("OSV pagination did not advance")
+            seen.add(token)
+            payload = {**payload, "page_token": token}
+        raise ValueError("OSV pagination limit exceeded")
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        log.error("OSV query incomplete: %s", exc)
+        return None
 
-    return kernel_ver
+def load_linux_kernel_db(cache_dir):
+    """Refresh atomically; a partial or stale archive cannot pass the gate."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "Linux_all.zip")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < OSV_CACHE_TTL_SECONDS:
+        if zipfile.is_zipfile(path):
+            return path
+    fd, tmp = tempfile.mkstemp(dir=cache_dir, suffix=".zip.tmp")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            with requests.get("https://osv-vulnerabilities.storage.googleapis.com/Linux/all.zip",
+                              timeout=(10, 120), stream=True) as response:
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size=65536):
+                    out.write(chunk)
+        with zipfile.ZipFile(tmp) as archive:
+            if not archive.namelist() or archive.testzip() is not None:
+                raise ScanError("Invalid Linux advisory archive")
+        os.replace(tmp, path)
+        return path
+    except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
+        raise ScanError("Could not refresh Linux advisory archive") from exc
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def check_linux_kernel_vulns(version_str, db_zip_path):
-    """Stream through the Linux DB zip and return only matching vulns.
-    Processes one record at a time to avoid loading the entire DB into memory."""
-    found_vulns = []
+    """Match each numeric version interval, including disjoint affected ranges."""
+    target = packaging_version.Version(version_str)
+    found = []
+    if not db_zip_path:
+        raise ScanError("Linux advisory archive unavailable")
     try:
-        target_ver = packaging_version.parse(version_str)
-    except:
-        return []
-
-    if not db_zip_path or not os.path.exists(db_zip_path):
-        print("Error: Linux DB zip not available")
-        return []
-
-    checked = 0
-    try:
-        with zipfile.ZipFile(db_zip_path, "r") as z:
-            for filename in z.namelist():
-                if not filename.endswith(".json"):
+        with zipfile.ZipFile(db_zip_path) as archive:
+            for name in archive.namelist():
+                if not name.endswith(".json"):
                     continue
-                with z.open(filename) as f:
-                    try:
-                        vuln = json.load(f)
-                    except:
-                        continue
-                checked += 1
+                with archive.open(name) as entry:
+                    vuln = json.load(entry)
+                if vuln.get("withdrawn"):
+                    continue
                 matched = False
-                affected_list = vuln.get('affected', [])
-                for affected in affected_list:
-                    if matched:
-                        break
-                    pkg = affected.get('package', {})
-                    if pkg.get('ecosystem') != 'Linux':
+                for affected in vuln.get("affected", []):
+                    if affected.get("package", {}).get("ecosystem") != "Linux":
                         continue
-                    ranges = affected.get('ranges', [])
-                    for r in ranges:
-                        if r.get('type') in ['SEMVER', 'ECOSYSTEM']:
-                            events = r.get('events', [])
-                            is_vuln_in_range = False
-                            for event in events:
-                                if 'introduced' in event:
-                                    intro = event['introduced']
-                                    try:
-                                        if intro == '0' or target_ver >= packaging_version.parse(intro):
-                                            is_vuln_in_range = True
-                                    except: pass
-                                elif 'fixed' in event:
-                                    fixed = event['fixed']
-                                    try:
-                                        if target_ver >= packaging_version.parse(fixed):
-                                            is_vuln_in_range = False
-                                    except: pass
-                                elif 'last_affected' in event:
-                                    last = event['last_affected']
-                                    try:
-                                        if target_ver > packaging_version.parse(last):
-                                            is_vuln_in_range = False
-                                    except: pass
-                            if is_vuln_in_range:
-                                found_vulns.append(vuln)
-                                matched = True
-                                break
-    except Exception as e:
-        print(f"Error streaming Linux DB zip: {e}")
-
-    print(f"Checked {checked} Linux records, found {len(found_vulns)} matching vulnerabilities.")
-    return found_vulns
+                    if version_str in affected.get("versions", []):
+                        matched = True
+                    for span in affected.get("ranges", []):
+                        if span.get("type") not in ("SEMVER", "ECOSYSTEM"):
+                            continue
+                        start = None
+                        for event in span.get("events", []):
+                            if "introduced" in event:
+                                start = packaging_version.Version(event["introduced"])
+                            else:
+                                end = next((k for k in ("fixed", "last_affected", "limit") if k in event), None)
+                                if end is None or start is None:
+                                    raise ScanError("Malformed Linux affected interval")
+                                upper = packaging_version.Version(event[end])
+                                if target >= start and (target <= upper if end == "last_affected" else target < upper):
+                                    matched = True
+                                start = None
+                        if start is not None and target >= start:
+                            matched = True
+                if matched:
+                    found.append(vuln)
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise ScanError("Could not read Linux advisory archive") from exc
+    return found
     
-def get_package_vulnerabilities(package_name, version, ecosystem, max_retries=10):
-    delay = 0.1
-    for attempt in range(max_retries):
-        try:
-            vulnerabilities = get_osv_vulnerabilities(
-                name=package_name, 
-                version=version, 
-                ecosystem=ecosystem
-            )
-            return vulnerabilities
-        except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                sleep_time = delay * (2 ** attempt) + random.uniform(0, 0.1)
-                print(f"Retrying in {sleep_time:.2f} seconds...")
-                time.sleep(sleep_time)
-    
-    print("Max retries reached. Moving on...")
-    return None
-
-def get_cache_dir():
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    cache_dir = os.path.join("/tmp", f"cve_cache_{current_date}")
-    # Clean up cache directories older than 8 hours
-    import glob
-    max_age = 28800  # 8 hours in seconds
-    for old_dir in glob.glob("/tmp/cve_cache_*"):
-        if os.path.isdir(old_dir):
-            dir_age = time.time() - os.path.getmtime(old_dir)
-            if dir_age > max_age:
-                try:
-                    import shutil
-                    shutil.rmtree(old_dir)
-                    print(f"Cleaned up stale cache: {old_dir} (age: {dir_age/3600:.1f}h)")
-                except Exception as e:
-                    print(f"Warning: failed to clean {old_dir}: {e}")
+def get_cache_dir(base_dir):
+    # Stable dir; per-entry 8h expiry (see OSV_CACHE_TTL_SECONDS) bounds staleness.
+    cache_dir = os.path.join(str(base_dir), "queries")
+    os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
-def main(eve_tag, sbom_file, cvss_bt_path, alpine_db_path, output_dir):
-    cache_dir = get_cache_dir()
-    cache = Cache(cache_dir)
-    spdx_packages = parse_spdx(sbom_file)
-    if not spdx_packages:
-        print("No SPDX data found at file: " + sbom_file)
+
+def _maybe_inject_kernel(spdx_packages, alpine_version, kernel_version):
+    """Append a generic Linux kernel package if `kernel_version` is given and the
+    SBOM has no kernel package. Mutates `spdx_packages` in place."""
+    if not kernel_version:
         return
-    
-    print(f"Found {len(spdx_packages)} packages in SPDX file")
-
-    cvss_data = load_cvss_bt_cache(cvss_bt_path)
-    if not cvss_data:
-        print("No CVSS BT data loaded.")
-        cvss_data = {}
-
-    alpine_db, alpine_db_by_cpe = load_alpine_db(alpine_db_path)
-    linux_db_zip = None
-
-    # Check for Linux kernel in packages
-    kernel_found = False
     for pkg in spdx_packages:
-        p_info = extract_package_info(pkg)
-        if p_info['ecosystem'] == 'Linux' or p_info['name'] == 'Kernel' or p_info['name'] == 'Linux':
-            kernel_found = True
-            break
-            
-    if not kernel_found:
-        print("Linux Kernel NOT found in SBOM. Fetching from remote...")
-        remote_k_ver = get_eve_kernel_version(eve_tag)
-        if remote_k_ver:
-            print(f"Adding remote Linux Kernel version: {remote_k_ver}")
-            clean_ver = remote_k_ver
-            if clean_ver.startswith('v'):
-                clean_ver = clean_ver[1:]
-            
-            spdx_packages.append({
-                "name": "Kernel",
-                "versionInfo": clean_ver,
-                "externalRefs": [
-                    {
-                        "referenceType": "purl", 
-                        "referenceLocator": f"pkg:generic/kernel@{clean_ver}"
-                    }
-                ]
-            })
-        else:
-             print("Warning: Failed to determine remote kernel version.")
+        info = extract_package_info(pkg, alpine_version)
+        if info["ecosystem"] == "Linux" or info["name"] in ("Kernel", "Linux"):
+            return
+    clean_ver = kernel_version.lstrip("v")
+    log.info("Kernel not in SBOM; adding Linux kernel version %s", clean_ver)
+    spdx_packages.append({
+        "name": "Kernel",
+        "versionInfo": clean_ver,
+        "externalRefs": [{
+            "referenceType": "purl",
+            "referenceLocator": f"pkg:generic/kernel@{clean_ver}",
+        }],
+    })
 
-    release_vulns = []
-    for pkg in spdx_packages:
-        pkg_info = extract_package_info(pkg)
-        print(f"Checking package: {pkg_info['name']} Version: {pkg_info['version']} Ecosystem: {pkg_info['ecosystem']}")
-        
-        vulns_data = None
 
-        if pkg_info['ecosystem'] == 'Linux' or pkg_info['name'] == 'Kernel':
-            ver_match = re.match(r'\d+\.\d+\.\d+', pkg_info['version'] or '')
-            if not ver_match:
-                print(f"    Warning: Could not extract kernel version from '{pkg_info['version']}', skipping.")
-                continue
-            pkg_info['version'] = ver_match[0]
-            print(f"    Checking Linux kernel vulnerabilities for version {pkg_info['version']}...")
-            if linux_db_zip is None:
-                linux_db_zip = load_linux_kernel_db()
-            print(f"    Checking against local Linux DB...")
-            vulns_list = check_linux_kernel_vulns(pkg_info['version'], linux_db_zip)
-            print(f"    Found {len(vulns_list)} Linux kernel vulnerabilities.")
-            vulns_data = {"vulns": vulns_list}
-        else:
-            cache_key = (pkg_info['name'], pkg_info['version'], pkg_info['ecosystem'], pkg_info['purl'])
-            if cache_key in cache:
-                vulns_data = cache[cache_key]
-                print("    Retrieved vulnerabilities from cache.")
-            else :
-                # try to get vulnerabilities from first by package name+ecosystem and version
-                if pkg_info["name"] and pkg_info["ecosystem"]:
-                    vulns_data = get_package_vulnerabilities(
-                        package_name=pkg_info["name"],
-                        version=pkg_info["version"],
-                        ecosystem=pkg_info["ecosystem"]
-                    )
-                elif not pkg_info["purl"]:
-                     print(f"    Warning: Skipping {pkg_info['name']} - Missing Ecosystem and PURL")
+def _query_osv(pkg_info, cache):
+    """Return OSV vulns for one non-kernel package (dict, possibly empty) or None
+    on API error. Reads and populates the 8h query cache."""
+    if not pkg_info["ecosystem"]:
+        log.warning("Primary coverage unresolved: unsupported ecosystem for %s", pkg_info["name"])
+        return {}  # Exact source commits can still be covered by the additive pass.
+    if not pkg_info["version"]:
+        log.warning("Coverage unresolved: no version for %s", pkg_info["name"])
+        return {}
+    if pkg_info["ecosystem"] in ("Alpine", "Debian"):
+        log.warning("Coverage unresolved: no distro release for %s", pkg_info["name"])
+        return {}
+    go_toolchain = _is_go_toolchain(pkg_info["name"], pkg_info["ecosystem"], pkg_info["purl"])
+    if go_toolchain:
+        try:
+            pkg_info = {**pkg_info, "version": _go_osv_version(pkg_info["version"])}
+        except ValueError as exc:
+            log.error("Go advisory coverage unresolved: %s", exc)
+            return None
+    cache_key = ("query-v2", pkg_info["name"], pkg_info["version"],
+                 pkg_info["ecosystem"], pkg_info["purl"])
+    if go_toolchain:
+        # Never reuse pre-fix responses, including cached empty/purl results.
+        cache_key = ("go-toolchain-semver-v1", *cache_key)
+    cached = cache.get(cache_key, default=_CACHE_MISS)
+    if cached is not _CACHE_MISS:
+        log.debug("    Retrieved vulnerabilities from cache.")
+        return cached
 
-                if not vulns_data and pkg_info["purl"]:
-                    # if no results, also try with PURL+version
-                    vulns_data = get_osv_vulnerabilities(
-                        purl=pkg_info["purl"],
-                        version=pkg_info["version"]
-                    )
-            
-                # store in cache ONLY if result is valid (non-None)
-                # We don't want to cache temporary network errors
-                if vulns_data is not None:
-                    cache[cache_key] = vulns_data
+    vulns_data = None
+    # Query by name + ecosystem first.
+    if pkg_info["name"] and pkg_info["ecosystem"]:
+        vulns_data = get_osv_vulnerabilities(
+            name=pkg_info["name"], version=pkg_info["version"],
+            ecosystem=pkg_info["ecosystem"])
+    elif not pkg_info["purl"]:
+        log.debug("    Skipping %s - no ecosystem or purl to query",
+                  pkg_info["name"] or "<unnamed>")
+        vulns_data = {}
 
-        if vulns_data is None:
-            print("    Skipping due to API error.")
-        elif not vulns_data:
-            print("    No vulnerabilities found.")
-            
-        if vulns_data and "vulns" in vulns_data:
-            pkg_secfixes = get_secfixes_for_package(pkg, alpine_db, alpine_db_by_cpe)
-            pkg_secfixes_set = set(s.lower() for s in pkg_secfixes)
-            
-            valid_vulns = []
-            for vuln in vulns_data["vulns"]:
-                vuln_id = vuln.get('id', 'Unknown')
-                
-                vuln['exploitablity'] = []
-                # gather all CVEs
-                cves = vuln.get('aliases', [])
-                for entry in vuln.get('upstream', []):
-                    if entry not in cves:
-                        cves.append(entry)
-                
-                # Check secfixes
-                in_secfixes = False
-                for c in cves:
-                    if c.lower() in pkg_secfixes_set:
-                        in_secfixes = True
-                        print(f"    Skipping {vuln_id} (alias {c}) as it is in secfixes for {pkg_info['name']}")
-                        break
-                
-                if in_secfixes:
-                    continue
+    # Fall back to a purl query, but don't let its errors mask a valid (empty)
+    # name-query result.
+    if not vulns_data and pkg_info["purl"] and not (pkg_info["ecosystem"] or "").startswith(("Alpine", "Debian")):
+        purl_result = get_osv_vulnerabilities(
+            purl=pkg_info["purl"], version=pkg_info["version"])
+        if purl_result is not None:
+            vulns_data = purl_result
 
-                # check CVSS BT data for each CVE
-                print(f"  Found vulnerability: {vuln_id} with aliases: {cves}")
-                exploits = [ cvss_data[e.lower()] for e in cves if e.lower() in cvss_data ]
-                if exploits:
-                    vuln['exploitablity'] = exploits
-                    print(f"    Added exploitability data for {vuln_id}")
-                
-                valid_vulns.append(vuln)
+    # Cache only valid results, never transient network errors.
+    if vulns_data is not None:
+        cache.set(cache_key, vulns_data, expire=OSV_CACHE_TTL_SECONDS)
+    return vulns_data
 
-            if valid_vulns:
-                release_vulns.append({
-                    "package": pkg,
-                    "vulnerabilities": valid_vulns
-                })
-        
-    print(f"Total vulnerabilities found: {len(release_vulns)}")
 
-    # Free large lookup structures no longer needed
-    del alpine_db, alpine_db_by_cpe, cvss_data
+def _write_results(results, output_file):
+    """Write the enriched SBOM (scan results) as JSON to `output_file`.
 
-    # Close cache to ensure all writes are flushed
-    cache_size = len(cache)
-    cache.close()
-    print(f"Cache saved to {cache_dir} with {cache_size} entries")
-
-    # save results to JSON file
-    output_file = os.path.join(output_dir, f"scan_results_{eve_tag.replace('/', '_')}.json")
+    Writes to a temp file in the same directory then atomically renames it, so
+    a killed process can never leave a half-written JSON that a later run would
+    reuse (the skip-if-exists logic treats any existing file as complete)."""
     try:
-        with open(output_file, "w", encoding="utf-8") as out_file:
-            json.dump(release_vulns, out_file, indent=2)
-        print(f"Scan results saved to {output_file}")
-    except Exception as e:
-        print(f"Error saving scan results: {e}")
+        d = os.path.dirname(os.path.abspath(output_file))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out_file:
+                json.dump(results, out_file, indent=2)
+                out_file.flush()
+                os.fsync(out_file.fileno())
+            os.replace(tmp, output_file)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        log.info("Scan results saved to %s", output_file)
+    except Exception as exc:
+        raise ScanError(f"Error saving scan results: {exc}") from exc
+
+
+def scan_sbom(sbom_file, cvss_bt_path, alpine_db_path, output_file,
+              osv_cache_dir, kernel_version=None):
+    # A failed new scan must not leave an old successful output to be uploaded.
+    if os.path.exists(output_file):
+        os.unlink(output_file)
+    packages = parse_spdx(sbom_file)
+    if not packages:
+        raise ScanError(f"Missing, malformed or empty SPDX packages: {sbom_file}")
+    from scan.fallback import releases_by_container, run_additive, package_key
+    releases = releases_by_container(packages)
+    cvss_data = load_cvss_bt_cache(cvss_bt_path) or {}
+    _maybe_inject_kernel(packages, None, kernel_version)
+    results, failures = [], []
+    linux_db = None
+    with Cache(get_cache_dir(osv_cache_dir)) as cache:
+        for pkg in packages:
+            # Mixed-container EVE SBOMs can contain different Alpine releases.
+            info = extract_package_info(pkg, releases.get(pkg.get("packageFileName") or ""))
+            log.info("Checking %s %s (%s)", info["name"], info["version"], info["ecosystem"])
+            if info["ecosystem"] == "Linux" or info["name"] == "Kernel":
+                match = re.match(r"v?(\d+\.\d+(?:\.\d+)?)(?:-|$)", info["version"] or "")
+                if not match:
+                    failures.append(f"Unknown kernel version: {info['version']}")
+                    continue
+                if linux_db is None:
+                    linux_db = load_linux_kernel_db(osv_cache_dir)
+                data = {"vulns": check_linux_kernel_vulns(match[1], linux_db)}
+            else:
+                data = _query_osv(info, cache)
+            if data is None:
+                failures.append(f"Advisory lookup failed: {info['name']} {info['version']}")
+                continue
+            accepted = []
+            for original in data.get("vulns", []):
+                if original.get("withdrawn"):
+                    continue
+                vuln = copy.deepcopy(original)
+                ids = {v for v in [vuln.get("id"), *vuln.get("aliases", []), *vuln.get("upstream", [])] if v}
+                # The legacy APKBUILD database flattens fixed versions away.
+                # It cannot prove an installed revision is fixed. Scoped OSV
+                # queries and the evidence-gated fallback retain version checks.
+                vuln["exploitability"] = [cvss_data[v.lower()] for v in sorted(ids) if v.lower() in cvss_data]
+                accepted.append(vuln)
+            if accepted:
+                results.append({"package": pkg, "vulnerabilities": accepted})
+        try:
+            additions = run_additive(packages, results, cache, cvss_data, output_file)
+            by_package = {package_key(row["package"]): row for row in results}
+            for row in additions:
+                existing = by_package.get(package_key(row["package"]))
+                if existing is not None:
+                    existing["vulnerabilities"].extend(row["vulnerabilities"])
+                else:
+                    results.append(row)
+                    by_package[package_key(row["package"])] = row
+        except Exception:
+            log.exception("Supplemental fallback unavailable; primary findings retained")
+    if failures:
+        _write_results(results, str(output_file) + ".partial.json")
+        raise ScanError("Incomplete primary scan: " + "; ".join(failures))
+    _write_results(results, output_file)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Scan an EVE SPDX SBOM")
+    parser.add_argument("eve_tag", help="Output label, not a source revision")
+    parser.add_argument("sbom_file")
+    parser.add_argument("cvss_bt_path")
+    parser.add_argument("alpine_db_path", help="Legacy argument retained for existing callers")
+    parser.add_argument("output_dir")
+    parser.add_argument("--kernel-version", help="Kernel from the exact scanned source revision, if absent in SBOM")
+    parser.add_argument("--cache-dir", default="out/cache/osv")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    output = os.path.join(args.output_dir, "scan_results_" + args.eve_tag.replace("/", "_") + ".json")
+    try:
+        scan_sbom(args.sbom_file, args.cvss_bt_path, args.alpine_db_path, output,
+                  args.cache_dir, kernel_version=args.kernel_version)
+    except (ScanError, OSError, ValueError) as exc:
+        log.error("%s", exc)
+        return 2
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        print("Usage: python scanner/scanner.py <eve_tag> <spdx_sbom_file> <cvss_bt_path> <alpine_db_path> <output_dir>")
-        sys.exit(1)
-    else:
-        main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    # Retain python ci/scan/scanner.py ... as well as python -m scan.scanner.
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    raise SystemExit(main())
