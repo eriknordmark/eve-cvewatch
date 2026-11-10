@@ -8,6 +8,12 @@ source "$SCRIPT_DIR/../common.sh"
 EVE_TAG="${1:?EVE tag required}"
 SBOM_PATH="${2:?SBOM path required}"
 mkdir -p "$(dirname "$SBOM_PATH")"
+# The SBOM and its image marker are a pair. Serialize readers/writers of this
+# path so two extractions cannot publish another image's marker over our bytes.
+# Keep the lock inode after exit; removing it would let a third process bypass
+# an existing waiter on the unlinked inode.
+exec 8>"$SBOM_PATH.lock"
+flock -w 120 8 || { log_error "SBOM cache path is busy"; exit 1; }
 
 if [ "$EVE_TAG" = master ]; then
     sha=$(curl -fsS 'https://api.github.com/repos/lf-edge/eve/commits/master' | jq -er .sha)

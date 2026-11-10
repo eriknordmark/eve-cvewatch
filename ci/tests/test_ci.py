@@ -236,7 +236,7 @@ esac
             count=len(calls.read_text().splitlines())
             self.assertEqual(run('master-bbbbbbbb').returncode,0)
             self.assertEqual(len(calls.read_text().splitlines()),count)
-            self.assertEqual(sorted(p.name for p in d.glob('sbom.json*')),['sbom.json','sbom.json.image'])
+            self.assertEqual(sorted(p.name for p in d.glob('sbom.json*')),['sbom.json','sbom.json.image','sbom.json.lock'])
 
     def test_historical_cache_uses_recorded_commit_not_latest_month_commit(self):
         script=(CI/'historical-master.sh').read_text()
