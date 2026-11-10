@@ -38,5 +38,34 @@ Bash syntax checks and `git diff --check` pass. Actionlint 1.7.12 does not yet
 recognize GitHub.com's documented `job.workflow_repository`/`job.workflow_sha`
 properties. With only those two property warnings excluded, workflow lint
 passes. The implementation uses the official GitHub context definitions, not
-an inferred caller ref. Full EVE image builds and live vulnerability-feed scans
-have not been run for this change.
+an inferred caller ref.
+
+### Real-image CI simulation (2026-11-10)
+
+All 70 offline regressions passed on Python 3.11. The actual `scan-inputs.sh`
+entrypoint also passed in disposable Python 3.10 containers using extracted
+published EVE SBOMs, pinned source kernel metadata, and live vulnerability feeds:
+
+| Image | Source commit | Kernel | Package finding rows | Advisory occurrences |
+| --- | --- | --- | ---: | ---: |
+| `16.0.1-lts-kvm-amd64` | `4a0809df86d47d5dafe3980276e6645162936849` | `6.12.49` | 265 | 9370 |
+| `0.0.0-master-7d265c2a-kvm-amd64` | `7d265c2a48a1f3b888c902c9fdd967fb305b33a1` | `6.18.55` | 250 | 3001 |
+
+These counts are scan findings, not confirmed reachability. Each image compared
+with itself passed. Removing one actual advisory from its baseline made the
+comparison fail with exit 1; ignoring that advisory restored exit 0. Malformed
+SBOM input returned exit 2 and removed stale successful output. Both ordinary
+PR and workflow-run input resolution selected the actual PR's `17.0-stable`
+base rather than master.
+
+The simulation exposed three additional issues, now covered by regressions:
+valid Linux ranges with repeated fixed events; unbounded CVSS metadata requests;
+and duplicated unscoped container records incorrectly inheriting the host's
+Alpine release. The fixes evaluate OSV event timelines, bound and atomically
+publish CVSS downloads, and retain scoped package ownership while preserving
+unambiguous host records.
+
+This was a local simulation with published images, not an EVE build from source
+or execution of the full reusable workflow on GitHub-hosted runners. Supplemental
+coverage limitations still apply. Test artifacts and newly pulled test images
+are removed after validation; pre-existing images are preserved.

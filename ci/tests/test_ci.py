@@ -137,6 +137,42 @@ test ! -e result.json
 ''',d)
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
+    def test_cvss_download_is_bounded_atomic_and_selects_named_asset(self):
+        for fail in (False, True):
+            with tempfile.TemporaryDirectory() as d:
+                body = r'''mkdir db
+echo previous > db/cvss-bt.csv
+curl() {
+    local output="" bounded=false retried=false
+    while [ "$#" -gt 1 ]; do
+        case "$1" in
+            --max-time) bounded=true; shift ;;
+            --retry) retried=true; shift ;;
+            -o) output="$2"; shift ;;
+        esac
+        shift
+    done
+    $bounded && $retried || return 99
+    if [ -z "$output" ]; then
+        echo '{"assets":[{"name":"wrong.zip","browser_download_url":"https://example.invalid/wrong"},{"name":"cvss-bt.csv","browser_download_url":"https://example.invalid/right"}]}'
+    else
+        [ "$1" = https://example.invalid/right ] || return 98
+        echo downloaded > "$output"
+        [ "$TEST_FAIL" = no ] || return 28
+    fi
+}
+if download_cvss_db db; then
+    [ "$TEST_FAIL" = no ] || exit 97
+    [ "$(cat db/cvss-bt.csv)" = downloaded ] || exit 96
+else
+    [ "$TEST_FAIL" = yes ] || exit 95
+    [ "$(cat db/cvss-bt.csv)" = previous ] || exit 94
+fi
+[ "$(find db -type f | wc -l)" -eq 1 ]
+'''
+                result=self.run_shell('TEST_FAIL='+('yes' if fail else 'no')+'\n'+body,d)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
     def test_metadata_evaluates_the_requested_architecture(self):
         with tempfile.TemporaryDirectory() as d:
             Path(d,'kernel-version.mk').write_text('ifeq ($(ZARCH),amd64)\nKERNEL_VERSION=v6.1.10\nelse\nKERNEL_VERSION=v5.10.1\nendif\n')

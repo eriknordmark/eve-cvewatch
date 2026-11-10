@@ -93,6 +93,30 @@ class ScanTests(unittest.TestCase):
             s.scan_sbom('sbom','cvss','unused',str(dest),str(Path(directory)/'cache'),**kw)
         return json.loads(dest.read_text())
 
+    def test_merged_container_copies_do_not_inherit_host_release(self):
+        raw={**package(purl='pkg:apk/busybox/musl@1.2.3-r4?distro=busybox-1.35.0'),
+             'name':'musl','versionInfo':'1.2.3-r4','SPDXID':'SPDXRef-old-musl'}
+        scoped={**raw,'packageFileName':'containers/services/debug/lower'}
+        host={**raw,'versionInfo':'1.2.5-r10','SPDXID':'SPDXRef-host-musl'}
+        data={'SPDXID':'SPDXRef-DOCUMENT','packages':[raw,scoped,host],
+              'relationships':[{'spdxElementId':'SPDXRef-DOCUMENT','relationshipType':'DESCRIBES','relatedSpdxElement':'SPDXRef-root'},
+                               {'spdxElementId':'SPDXRef-root','relationshipType':'CONTAINS','relatedSpdxElement':'SPDXRef-host-musl'}]}
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'sbom.json';path.write_text(json.dumps(data))
+            result=s.parse_spdx(path)
+            self.assertEqual([(p['SPDXID'],p['packageFileName']) for p in result],
+                             [('SPDXRef-old-musl','containers/services/debug/lower'),('SPDXRef-host-musl',None)])
+            # Explicit root ownership wins when a package is shared by root and container.
+            data['relationships'].append({'spdxElementId':'SPDXRef-root','relationshipType':'CONTAINS','relatedSpdxElement':'SPDXRef-old-musl'})
+            path.write_text(json.dumps(data))
+            self.assertEqual(len(s.parse_spdx(path)),3)
+            # A root ID reused by a container cannot establish host ownership.
+            data['packages'].append({'name':'sbom','SPDXID':'SPDXRef-root',
+                                     'packageFileName':'containers/services/debug/lower'})
+            path.write_text(json.dumps(data))
+            remaining=s.parse_spdx(path)
+            self.assertFalse(any(p['SPDXID']=='SPDXRef-old-musl' and not p['packageFileName'] for p in remaining))
+
     def test_failed_primary_scan_removes_old_success_and_saves_diagnostics(self):
         with tempfile.TemporaryDirectory() as d:
             output=Path(d)/'scan.json';output.write_text('[]')
@@ -157,6 +181,20 @@ class KernelTests(unittest.TestCase):
                 self.assertEqual(bool(s.check_linux_kernel_vulns(version,p)),match,version)
             self.archive(p,[{'introduced':'0'}],withdrawn=True)
             self.assertEqual(s.check_linux_kernel_vulns('5.0',p),[])
+
+    def test_live_linux_feed_repeated_fixes_are_valid(self):
+        # CVE-2022-48747, observed in the actual Linux/all.zip image scan.
+        events=[{'introduced':'5.5.0'},{'fixed':'5.10.96'},{'fixed':'5.15.19'}]
+        for version, expected in [('5.5.0',True),('5.10.95',True),('5.10.96',False),('6.12.49',False)]:
+            self.assertEqual(s.version_in_range(s.packaging_version.Version(version), events),expected)
+
+    def test_unsorted_events_and_limits_follow_osv_timeline(self):
+        events=[{'fixed':'6.2'},{'introduced':'6.0'},{'fixed':'5.2'},{'introduced':'5.0'}]
+        for version,expected in [('4.9',False),('5.1',True),('5.3',False),('6.1',True),('6.2',False)]:
+            self.assertEqual(s.version_in_range(s.packaging_version.Version(version),events),expected)
+        target=s.packaging_version.Version('6.1')
+        self.assertFalse(s.version_in_range(target,events+[{'limit':'6.0'}]))
+        self.assertTrue(s.version_in_range(target,events+[{'limit':'6.0'},{'limit':'*'}]))
 
     def test_corrupt_database_fails(self):
         with tempfile.TemporaryDirectory() as d:

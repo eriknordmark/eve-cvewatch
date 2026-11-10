@@ -89,17 +89,26 @@ download_cvss_db() {
 
     log_info "Downloading cvss-bt.csv..."
     local download_url
-    download_url=$(curl -s "$cvss_url" | jq -r '.assets[0].browser_download_url')
-    
-    if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
-        log_error "Failed to get cvss-bt download URL"
+    if ! download_url=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        --retry 2 --retry-all-errors --retry-max-time 90 "$cvss_url" | \
+        jq -er '[.assets[] | select(.name == "cvss-bt.csv")][0].browser_download_url'); then
+        log_error "Failed to resolve the CVSS database download"
         return 1
     fi
-    
-    if ! curl -L -f -o "$target_file" "$download_url"; then
-        log_error "Failed to download cvss-bt.csv"
+    if [[ "$download_url" != https://* ]]; then
+        log_error "Invalid CVSS database URL"
         return 1
     fi
+    local download_tmp
+    download_tmp=$(mktemp "${target_file}.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 300 \
+        --retry 2 --retry-all-errors --retry-max-time 600 \
+        -o "$download_tmp" "$download_url"; then
+        rm -f "$download_tmp"
+        log_error "Failed to download CVSS database"
+        return 1
+    fi
+    mv "$download_tmp" "$target_file"
     log_info "Successfully downloaded cvss-bt.csv to $cache_dir"
 }
 

@@ -95,7 +95,28 @@ def parse_spdx(file_path):
             log.info("No packages found in SPDX file.")
             return None
         
-        for package in spdx_data["packages"]:
+        # Merged EVE SBOMs retain original unscoped container records as well
+        # as copies carrying packageFileName. Do not treat the originals as
+        # host packages and apply the host's Alpine release to them.
+        raw_packages = spdx_data["packages"]
+        def record_key(pkg):
+            return pkg.get("SPDXID"), pkg.get("name"), pkg.get("versionInfo")
+        scoped = {record_key(pkg) for pkg in raw_packages
+                  if pkg.get("packageFileName") and pkg.get("SPDXID")}
+        relationships = spdx_data.get("relationships", [])
+        roots = {r.get("relatedSpdxElement") for r in relationships
+                 if r.get("relationshipType") == "DESCRIBES"
+                 and r.get("spdxElementId") == spdx_data.get("SPDXID")}
+        # EVE also merges document-root IDs such as "Directory-sbom" from
+        # multiple container SBOMs. Such reused roots cannot prove host ownership.
+        roots -= {pkg.get("SPDXID") for pkg in raw_packages if pkg.get("packageFileName")}
+        root_packages = {r.get("relatedSpdxElement") for r in relationships
+                         if r.get("relationshipType") == "CONTAINS"
+                         and r.get("spdxElementId") in roots}
+        for package in raw_packages:
+            if (not package.get("packageFileName") and record_key(package) in scoped
+                    and package.get("SPDXID") not in root_packages):
+                continue
             package_info = {
                 # required fields
                 "name": package.get("name", "Unknown"),
@@ -300,6 +321,40 @@ def load_linux_kernel_db(cache_dir):
             os.unlink(tmp)
 
 
+def version_in_range(target, events):
+    """Evaluate the OSV event timeline, not assumed introduced/fixed pairs.
+
+    OSV permits repeated fixed events and does not require sorted input. Limits
+    are an independent scope check. See https://ossf.github.io/osv-schema/#evaluation.
+    """
+    timeline, limits = [], []
+    introduced = False
+    for event in events:
+        if not isinstance(event, dict) or len(event) != 1:
+            raise ScanError("Malformed Linux affected event")
+        kind, value = next(iter(event.items()))
+        if kind == "limit":
+            limits.append(None if value == "*" else packaging_version.Version(value))
+        elif kind in ("introduced", "fixed", "last_affected"):
+            timeline.append((packaging_version.Version(value), kind))
+            introduced = introduced or kind == "introduced"
+        else:
+            raise ScanError("Unknown Linux affected event")
+    if not introduced:
+        raise ScanError("Linux range has no introduced event")
+    if limits and not any(limit is None or target < limit for limit in limits):
+        return False
+    vulnerable = False
+    for version, kind in sorted(timeline, key=lambda item: item[0]):
+        if kind == "introduced" and target >= version:
+            vulnerable = True
+        elif kind == "fixed" and target >= version:
+            vulnerable = False
+        elif kind == "last_affected" and target > version:
+            vulnerable = False
+    return vulnerable
+
+
 def check_linux_kernel_vulns(version_str, db_zip_path):
     """Match each numeric version interval, including disjoint affected ranges."""
     target = packaging_version.Version(version_str)
@@ -324,19 +379,7 @@ def check_linux_kernel_vulns(version_str, db_zip_path):
                     for span in affected.get("ranges", []):
                         if span.get("type") not in ("SEMVER", "ECOSYSTEM"):
                             continue
-                        start = None
-                        for event in span.get("events", []):
-                            if "introduced" in event:
-                                start = packaging_version.Version(event["introduced"])
-                            else:
-                                end = next((k for k in ("fixed", "last_affected", "limit") if k in event), None)
-                                if end is None or start is None:
-                                    raise ScanError("Malformed Linux affected interval")
-                                upper = packaging_version.Version(event[end])
-                                if target >= start and (target <= upper if end == "last_affected" else target < upper):
-                                    matched = True
-                                start = None
-                        if start is not None and target >= start:
+                        if version_in_range(target, span.get("events", [])):
                             matched = True
                 if matched:
                     found.append(vuln)
