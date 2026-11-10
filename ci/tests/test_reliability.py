@@ -71,6 +71,9 @@ class QueryTests(unittest.TestCase):
     def test_scoped_npm_and_go_subpaths(self):
         npm=s.extract_package_info(package(purl='pkg:npm/%40scope/module@1.0.0?x=y'))
         self.assertEqual(npm['purl'],'pkg:npm/%40scope/module')
+        self.assertEqual(npm['name'],'@scope/module')
+        maven=s.extract_package_info(package(purl='pkg:maven/org.example/module@1.0.0'))
+        self.assertEqual(maven['name'],'org.example:module')
         go=s.extract_package_info(package(purl='pkg:golang/example.com/module@v1.0.0#subpkg'))
         self.assertEqual(go['name'],'example.com/module')
 

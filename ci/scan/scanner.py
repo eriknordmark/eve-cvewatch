@@ -74,6 +74,10 @@ def extract_package_info(package, alpine_version=None):
             ecosystem = "Go"
     if ecosystem == "Go" and path.startswith("pkg:golang/"):
         name = unquote(path.removeprefix("pkg:golang/"))
+    elif kind == "npm":
+        name = unquote(path.removeprefix("pkg:npm/"))
+    elif kind == "maven":
+        name = unquote(path.removeprefix("pkg:maven/")).replace("/", ":", 1)
     if name in ("Kernel", "Linux"):
         ecosystem = "Linux"
     if ecosystem == "Linux":
